@@ -6,6 +6,8 @@ VPScry is a read-only health and security auditor for Debian 12 and Debian 13 VP
 
 It inspects the local system, correlates configuration with runtime state, highlights security and operational issues, and writes detailed reports. It does not automatically change the server.
 
+VPScry combines “VPS” with “scry” — to look closely and reveal what is normally hidden.
+
 ## What it checks
 
 VPScry covers:
