@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://0ut3r.space/vpscry/schema/report-2.0.0.json",
+  "$id": "urn:vpscry:schema:report:2.0.0",
   "title": "VPScry report",
   "type": "object",
   "additionalProperties": false,
