@@ -1,0 +1,29 @@
+# VPScry example policy
+# Data-only key=value format. This file is parsed, never sourced.
+
+expected_ports=tcp:22,tcp:80,tcp:443
+expected_services=ssh.service,nginx.service
+expected_websites=example.com,www.example.com
+expected_timers=apt-daily-upgrade.timer
+expected_backups=restic,/usr/local/sbin/backup.sh
+
+severity_profile=balanced
+fail_on=none
+evidence_limit=1600
+command_timeout=90
+
+disk_warn_percent=80
+disk_fail_percent=95
+inode_warn_percent=80
+inode_fail_percent=95
+backup_max_age_days=30
+log_growth_mib=20
+
+formats=text,markdown,json,html,actions
+
+# sarif=true
+# output_dir=/var/lib/vpscry/reports
+# baseline_file=/var/lib/vpscry/host.baseline
+# write_baseline_file=/var/lib/vpscry/host.baseline
+# redact_literal=internal-hostname.example
+# suppress=KERN-SYSCTL-001|2026-12-31|Accepted for application compatibility

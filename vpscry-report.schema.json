@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://0ut3r.space/vpscry/schema/report-2.0.0.json",
+  "title": "VPScry report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "tool",
+    "tool_version",
+    "display_name",
+    "author",
+    "website",
+    "tagline",
+    "host",
+    "started_at",
+    "online_permitted",
+    "root_privileges",
+    "expected_ports",
+    "terminal_mode",
+    "severity_profile",
+    "evidence_limit",
+    "command_timeout_seconds",
+    "summary",
+    "results"
+  ],
+  "properties": {
+    "schema_version": {"const": "2.0.0"},
+    "tool": {"const": "vpscry"},
+    "tool_version": {"type": "string"},
+    "display_name": {"const": "VPScry"},
+    "author": {"type": "string"},
+    "website": {"type": "string"},
+    "tagline": {"type": "string"},
+    "host": {"type": "string"},
+    "started_at": {"type": "string", "format": "date-time"},
+    "online_permitted": {"type": "boolean"},
+    "root_privileges": {"type": "boolean"},
+    "expected_ports": {"type": "string"},
+    "terminal_mode": {"enum": ["progress", "verbose", "quiet"]},
+    "severity_profile": {"enum": ["balanced", "strict", "relaxed"]},
+    "evidence_limit": {"type": "integer", "minimum": 400, "maximum": 12000},
+    "command_timeout_seconds": {"type": "integer", "minimum": 2, "maximum": 300},
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fail", "warn", "pass", "info", "skip"],
+      "properties": {
+        "fail": {"type": "integer", "minimum": 0},
+        "warn": {"type": "integer", "minimum": 0},
+        "pass": {"type": "integer", "minimum": 0},
+        "info": {"type": "integer", "minimum": 0},
+        "skip": {"type": "integer", "minimum": 0}
+      }
+    },
+    "results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "category", "status", "severity", "confidence", "title", "evidence", "verification_command", "recommendation"],
+        "properties": {
+          "id": {"type": "string", "pattern": "^[A-Z0-9][A-Z0-9-]+$"},
+          "category": {"type": "string"},
+          "status": {"enum": ["PASS", "WARN", "FAIL", "INFO", "SKIP"]},
+          "severity": {"enum": ["INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL"]},
+          "confidence": {"enum": ["LOW", "MEDIUM", "HIGH"]},
+          "title": {"type": "string"},
+          "evidence": {"type": "string"},
+          "verification_command": {"type": "string"},
+          "recommendation": {"type": "string"}
+        }
+      }
+    }
+  }
+}
