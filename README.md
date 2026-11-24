@@ -30,6 +30,7 @@ Optional components that are not installed are treated as neutral, not as passed
 
 - Debian 12 or Debian 13
 - Bash
+- standard Debian command-line tools, including GNU coreutils (`sha256sum`, `mktemp`, `realpath`)
 - root privileges recommended for a complete audit
 
 No installation is required.
@@ -69,6 +70,10 @@ report.html          standalone HTML
 ```
 
 SARIF is optional.
+
+Report files use mode `0600`; newly created report directories use `0700`. Existing directory permissions and unrelated files are preserved. With `sudo`, created reports belong to the invoking user.
+
+Reports and baselines are written through temporary files and replaced atomically per file. Output directories must belong to the caller or the invoking `sudo` user and must not be group/world-writable. Symlink output directories and symlink, hardlink or non-regular destination files are rejected. A write failure returns exit code `1`; files completed earlier in the run may already exist.
 
 Reports can contain sensitive information about the host. Do not publish them without reviewing their contents.
 
@@ -125,6 +130,8 @@ suppress
 
 `redact_literal` and `suppress` may be specified more than once.
 
+`redact_literal` performs case-sensitive literal replacement in finding titles, evidence, verification commands, recommendations, suppression reasons and host metadata. It is not automatic secret detection.
+
 Suppression format:
 
 ```text
@@ -146,6 +153,8 @@ Compare a later audit with it:
 sudo ./vpscry.sh \
   --baseline /var/lib/vpscry/host.baseline
 ```
+
+Baselines compare finding IDs, statuses and SHA-256 hashes of stored evidence. Evidence is normalized, redacted and limited by `evidence_limit` before hashing. Legacy fingerprints support status comparison only and require a new reviewed baseline for evidence comparison.
 
 ## Command-line options
 
@@ -234,6 +243,19 @@ VPScry does not intentionally:
 - make outbound connections unless `--online` is used.
 
 VPScry is an auditing aid. Findings should be reviewed in the context of the actual server workload and network design.
+
+Firewall analysis is conservative: unsupported rules, multiple input chains and unresolved chain traversal require manual review. A default drop policy alone does not prove effective protection. PostgreSQL HBA includes and ambiguous Tor instance configurations are marked as incomplete instead of passing authentication checks.
+
+## Tests
+
+The regression suite requires Python 3 and uses local fixtures without changing service configuration:
+
+```bash
+bash -n vpscry.sh
+python3 -B -m unittest discover -s tests -v
+```
+
+GitHub Actions runs the suite on Debian 12 and Debian 13 containers.
 
 ## License
 

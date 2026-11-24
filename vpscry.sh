@@ -4,7 +4,7 @@ set -uo pipefail
 
 PROGRAM="vpscry"
 DISPLAY_NAME="VPScry"
-VERSION="1.0.0"
+VERSION="1.0.1"
 REPORT_TITLE="VPScry Report"
 TAGLINE="See what your VPS is hiding."
 AUTHOR="Hoek"
@@ -159,12 +159,13 @@ USAGE
 }
 
 literal_replace() {
-    local value="${1-}" needle="${2-}" replacement="${3-}"
+    local value="${1-}" needle="${2-}" replacement="${3-}" result=""
     [[ -n "$needle" ]] || { printf '%s' "$value"; return; }
     while [[ "$value" == *"$needle"* ]]; do
-        value="${value%%"$needle"*}${replacement}${value#*"$needle"}"
+        result+="${value%%"$needle"*}${replacement}"
+        value="${value#*"$needle"}"
     done
-    printf '%s' "$value"
+    printf '%s' "$result$value"
 }
 
 redact_text() {
@@ -233,7 +234,7 @@ validate_policy_settings() {
 }
 
 fatal() {
-    printf 'ERROR: %s\n' "$*" >&2
+    printf 'ERROR: %s\n' "$(redact_text "$*")" >&2
     exit 1
 }
 
@@ -275,13 +276,8 @@ shorten() {
 }
 
 json_escape() {
-    local value="${1-}"
-    value=${value//\\/\\\\}
-    value=${value//\"/\\\"}
-    value=${value//$'\n'/\\n}
-    value=${value//$'\r'/\\r}
-    value=${value//$'\t'/\\t}
-    printf '%s' "$value"
+    json_escape_set "${1-}"
+    printf '%s' "$ESCAPED_VALUE"
 }
 
 html_escape() {
@@ -364,7 +360,7 @@ add_result() {
     severity="$4"
     confidence="$5"
     title="$6"
-    evidence="$(shorten "$(redact_text "${7-}")")"
+    evidence="${7-}"
     verify="$(shorten "$(redact_text "${8-}")" 800)"
     recommendation="$(shorten "$(redact_text "${9-}")")"
 
@@ -381,9 +377,12 @@ add_result() {
         else
             original_status="$status"; original_severity="$severity"
             status="INFO"; severity="INFO"; title="Suppressed: $title"
-            evidence="$(shorten "$evidence; suppression_until=${SUPPRESS_UNTIL[$id]}; suppression_reason=${SUPPRESS_REASON[$id]}; original_status=$original_status; original_severity=$original_severity.")"
+            evidence+="; suppression_until=${SUPPRESS_UNTIL[$id]}; suppression_reason=${SUPPRESS_REASON[$id]}; original_status=$original_status; original_severity=$original_severity."
         fi
     fi
+
+    title="$(redact_text "$title")"
+    evidence="$(shorten "$(redact_text "$evidence")")"
 
     if [[ -n "${SEEN_RESULT_ID[$id]+x}" ]]; then
         return 0
@@ -787,7 +786,7 @@ check_time_and_reboot() {
 }
 
 check_systemd() {
-    local state failed_services failed_timers running_count restart_units unit nrestarts custom_count unsafe_units=0
+    local state failed_services failed_timers running_count running_services restart_units unit nrestarts custom_count unsafe_units=0 restart_incomplete=0
     if ! have systemctl; then
         add_result "SVC-SYSTEMD-001" "services" "SKIP" "INFO" "HIGH" \
             "systemd service state could not be checked" "systemctl is unavailable." \
@@ -807,6 +806,11 @@ check_systemd() {
                 "systemd reports a degraded system state" "is-system-running=$state." \
                 "systemctl --failed --all" "Investigate failed units and their dependency chain."
             ;;
+        '')
+            add_result "SVC-SYSTEMD-001" "services" "SKIP" "INFO" "HIGH" \
+                "systemd state could not be read" "systemctl is-system-running returned no state." \
+                "systemctl is-system-running" "Check access to the systemd manager."
+            ;;
         *)
             add_result "SVC-SYSTEMD-001" "services" "WARN" "MEDIUM" "MEDIUM" \
                 "systemd is not in the normal running state" "is-system-running=${state:-unknown}." \
@@ -815,8 +819,11 @@ check_systemd() {
             ;;
     esac
 
-    failed_services="$(systemctl --failed --type=service --no-legend --plain 2>/dev/null | sed '/^[[:space:]]*$/d' || true)"
-    if [[ -n "$failed_services" ]]; then
+    if ! failed_services="$(systemctl --failed --type=service --no-legend --plain 2>/dev/null | sed '/^[[:space:]]*$/d')"; then
+        add_result "SVC-FAILED-001" "services" "SKIP" "INFO" "HIGH" \
+            "Failed systemd services could not be checked" "systemctl failed to list failed services." \
+            "systemctl --failed --type=service --all" "Check access to the systemd manager and repeat the audit."
+    elif [[ -n "$failed_services" ]]; then
         add_result "SVC-FAILED-001" "services" "FAIL" "HIGH" "HIGH" \
             "One or more systemd services are failed" \
             "$failed_services" \
@@ -830,8 +837,11 @@ check_systemd() {
             "No action required."
     fi
 
-    failed_timers="$(systemctl --failed --type=timer --no-legend --plain 2>/dev/null | sed '/^[[:space:]]*$/d' || true)"
-    if [[ -n "$failed_timers" ]]; then
+    if ! failed_timers="$(systemctl --failed --type=timer --no-legend --plain 2>/dev/null | sed '/^[[:space:]]*$/d')"; then
+        add_result "SVC-TIMER-001" "services" "SKIP" "INFO" "HIGH" \
+            "Failed systemd timers could not be checked" "systemctl failed to list failed timers." \
+            "systemctl --failed --type=timer --all" "Check access to the systemd manager and repeat the audit."
+    elif [[ -n "$failed_timers" ]]; then
         add_result "SVC-TIMER-001" "services" "FAIL" "HIGH" "HIGH" \
             "One or more systemd timers are failed" "$failed_timers" \
             "systemctl --failed --type=timer --all; systemctl list-timers --all" \
@@ -844,26 +854,38 @@ check_systemd() {
             "No action required."
     fi
 
-    running_count="$(systemctl list-units --type=service --state=running --no-legend --plain 2>/dev/null | wc -l | tr -d ' ')"
-    add_result "SVC-INVENTORY-001" "services" "INFO" "INFO" "HIGH" \
-        "Running service inventory" "$running_count services are currently in the running state." \
-        "systemctl list-units --type=service --state=running --no-pager" \
-        "Service count alone is not scored; review actual purpose and exposure."
+    if running_services="$(systemctl list-units --type=service --state=running --no-legend --plain 2>/dev/null)"; then
+        running_count="$(sed '/^[[:space:]]*$/d' <<< "$running_services" | wc -l | tr -d ' ')"
+        add_result "SVC-INVENTORY-001" "services" "INFO" "INFO" "HIGH" \
+            "Running service inventory" "$running_count services are currently in the running state." \
+            "systemctl list-units --type=service --state=running --no-pager" \
+            "Service count alone is not scored; review actual purpose and exposure."
+    else
+        running_services=""; restart_incomplete=1
+        add_result "SVC-INVENTORY-001" "services" "SKIP" "INFO" "HIGH" \
+            "Running service inventory could not be read" "systemctl failed to list running services." \
+            "systemctl list-units --type=service --state=running --no-pager" "Check access to the systemd manager."
+    fi
 
     restart_units=""
     while IFS= read -r unit; do
         [[ -n "$unit" ]] || continue
-        nrestarts="$(systemctl show "$unit" -p NRestarts --value 2>/dev/null || true)"
-        if [[ "$nrestarts" =~ ^[0-9]+$ ]] && (( nrestarts >= 5 )); then
+        if ! nrestarts="$(systemctl show "$unit" -p NRestarts --value 2>/dev/null)" || [[ ! "$nrestarts" =~ ^[0-9]+$ ]]; then
+            restart_incomplete=1
+        elif (( nrestarts >= 5 )); then
             restart_units+="$unit NRestarts=$nrestarts; "
         fi
-    done < <(systemctl list-units --type=service --state=running --no-legend --plain 2>/dev/null | awk '{print $1}')
+    done < <(awk '{print $1}' <<< "$running_services")
 
     if [[ -n "$restart_units" ]]; then
         add_result "SVC-RESTART-001" "services" "WARN" "MEDIUM" "MEDIUM" \
             "Services with repeated automatic restarts were detected" "$restart_units" \
             "systemctl show UNIT -p NRestarts,Restart,Result; journalctl -u UNIT -b" \
             "Determine whether restarts are expected or indicate a crash loop."
+    elif (( restart_incomplete )); then
+        add_result "SVC-RESTART-001" "services" "SKIP" "INFO" "HIGH" \
+            "Service restart counts could not be fully checked" "A service inventory or NRestarts query failed." \
+            "systemctl show UNIT -p NRestarts" "Check access to the systemd manager and repeat the audit."
     else
         add_result "SVC-RESTART-001" "services" "PASS" "INFO" "MEDIUM" \
             "No high restart count was detected" "No running service reported NRestarts >= 5." \
@@ -1507,21 +1529,58 @@ net_parse_ufw() {
 }
 
 net_parse_nft() {
-    local rules family="both" line proto spec policy
+    local rules family line proto spec kind policy parsed
+    local v4_chains=0 v6_chains=0
     have nft || return 0
-    rules="$(nft list ruleset 2>/dev/null || true)"
+    if ! rules="$(nft -nn list ruleset 2>/dev/null)"; then
+        NET_FW_COMPLEX=1
+        return 0
+    fi
     [[ -n "$rules" ]] || return 0
     NET_FW_SOURCES+=("nftables")
-    while IFS= read -r line; do
-        if [[ "$line" =~ ^[[:space:]]*table[[:space:]]+(inet|ip|ip6)[[:space:]] ]]; then
-            case "${BASH_REMATCH[1]}" in
-                inet) family="both" ;;
-                ip) family="v4" ;;
-                ip6) family="v6" ;;
-            esac
-        fi
-        if [[ "$line" == *"hook input"* && "$line" =~ policy[[:space:]]+(drop|reject|accept) ]]; then
-            policy="${BASH_REMATCH[1]}"
+    parsed="$(awk '
+        function clean(s,    i,c,out,quoted,escaped) {
+            out=""; quoted=0; escaped=0
+            for(i=1;i<=length(s);i++) {
+                c=substr(s,i,1)
+                if(!quoted && c=="#") break
+                if(!quoted && substr(s,i) ~ /^comment[[:space:]]/) break
+                out=out c
+                if(c=="\"" && !escaped) quoted=!quoted
+                if(c=="\\" && !escaped) escaped=1; else escaped=0
+            }
+            return out
+        }
+        {
+            line=clean($0)
+            sub(/^[[:space:]]+/, "", line); sub(/[[:space:]]+$/, "", line)
+            if(line ~ /^table[[:space:]]/) {
+                split(line, fields, /[[:space:]]+/)
+                family=(fields[2]=="inet" ? "both" : fields[2]=="ip" ? "v4" : fields[2]=="ip6" ? "v6" : "")
+                chain=0; input=0; depth=0
+            }
+            if(depth==1 && line ~ /^chain[[:space:]]/) {chain=1; input=0}
+            if(chain && depth==2 && line ~ /hook[[:space:]]+input[[:space:]]/ && family!="") {
+                input=1; policy="accept"
+                if(line ~ /policy[[:space:]]+drop/) policy="drop"
+                print "policy|" family "|" policy
+                if(line !~ /^type[[:space:]]+filter[[:space:]]/ || line !~ /;[[:space:]]*$/) print "complex|" family "|"
+            } else if(input && depth==2 && line!="" && line!="}") {
+                print "rule|" family "|" line
+            }
+            structural=line
+            gsub(/"([^"\\]|\\.)*"/, "", structural)
+            opens=gsub(/\{/, "{", structural); closes=gsub(/\}/, "}", structural)
+            depth+=opens-closes
+            if(depth<2) {chain=0; input=0}
+        }
+    ' <<< "$rules")" || { NET_FW_COMPLEX=1; return 0; }
+    while IFS='|' read -r kind family line; do
+        [[ -n "$kind" ]] || continue
+        if [[ "$kind" == policy ]]; then
+            policy="$line"
+            [[ "$family" == v4 || "$family" == both ]] && v4_chains=$((v4_chains+1))
+            [[ "$family" == v6 || "$family" == both ]] && v6_chains=$((v6_chains+1))
             case "$family:$policy" in
                 v4:drop|v4:reject) NET_FW_V4_POLICY="restrictive" ;;
                 v4:accept) [[ "$NET_FW_V4_POLICY" == "unknown" ]] && NET_FW_V4_POLICY="permissive" ;;
@@ -1533,18 +1592,25 @@ net_parse_nft() {
                     [[ "$NET_FW_V6_POLICY" == "unknown" ]] && NET_FW_V6_POLICY="permissive"
                     ;;
             esac
+            continue
         fi
-        if [[ "$line" == *" accept"* && ( "$line" == *"dport @"* || "$line" == *" vmap "* || "$line" == *" verdict map "* ) ]]; then
-            NET_FW_COMPLEX=1
-        fi
-        if [[ "$line" == *" accept"* && "$line" != *" dport "* && ( "$line" == *"iifname"* || "$line" == *" saddr "* ) ]]; then
-            NET_FW_COMPLEX=1
-        fi
-        if [[ "$line" == *" accept"* && "$line" =~ (tcp|udp)[[:space:]]+dport[[:space:]]+(\{[^\}]+\}|[0-9]+([:-][0-9]+)?) ]]; then
+        if [[ "$kind" == complex ]]; then NET_FW_COMPLEX=1; continue; fi
+        line="$(sed -E 's/[[:space:]]*# handle [0-9]+$//; s/(^|[[:space:]])counter( packets [0-9]+ bytes [0-9]+)?/ /g; s/[[:space:]]+/ /g; s/^ //; s/ $//' <<< "$line")"
+        if [[ "$line" =~ ^(tcp|udp)[[:space:]]+dport[[:space:]]+(\{[0-9,[:space:]:-]+\}|[0-9]+([:-][0-9]+)?)[[:space:]]+accept$ ]]; then
             proto="${BASH_REMATCH[1]}"; spec="${BASH_REMATCH[2]}"
             net_add_fw_spec "$family" "$proto" "$spec"
+        elif [[ "$line" == 'iifname "lo" accept' || "$line" == 'iif "lo" accept' || "$line" == 'ct state invalid drop' ]]; then
+            continue
+        elif [[ "$line" =~ ^ct[[:space:]]+state[[:space:]]+(established,related|related,established|established|\{[[:space:]]*(established,[[:space:]]*related|related,[[:space:]]*established|established)[[:space:]]*\})[[:space:]]+accept$ ]]; then
+            continue
+        elif [[ "$line" =~ ^(ip[[:space:]]+protocol[[:space:]]+icmp|ip6[[:space:]]+nexthdr[[:space:]]+ipv6-icmp|meta[[:space:]]+l4proto[[:space:]]+(icmp|ipv6-icmp))[[:space:]]+accept$ ]]; then
+            continue
+        elif [[ -n "$line" ]]; then
+            NET_FW_COMPLEX=1
         fi
-    done <<< "$rules"
+    done <<< "$parsed"
+    (( v4_chains>1 || v6_chains>1 )) && NET_FW_COMPLEX=1
+    return 0
 }
 
 net_parse_iptables_family() {
@@ -1649,6 +1715,10 @@ net_policy_result() {
         add_result "$id" "network" "INFO" "INFO" "HIGH" "$title" \
             "$evidence No routed public $family address was detected." "$verify" \
             "Keep policy parity documented before enabling public $family connectivity."
+    elif (( NET_FW_COMPLEX )); then
+        add_result "$id" "network" "WARN" "MEDIUM" "LOW" "$title" \
+            "$evidence Rule evaluation is incomplete; the default policy does not prove effective filtering." "$verify" \
+            "Review chain traversal, rule order and source/interface conditions before relying on firewall coverage."
     elif [[ "$policy" == "restrictive" ]]; then
         add_result "$id" "network" "PASS" "INFO" "HIGH" "$title" "$evidence" "$verify" \
             "Review explicit allow rules against intended services."
@@ -1856,6 +1926,7 @@ check_network() {
         if [[ "$NET_FW_V4_POLICY" == "unknown" && "$NET_FW_V6_POLICY" == "unknown" && "$fw_aggregate_status" == "PASS" ]]; then
             fw_aggregate_status="INFO"
         fi
+        if (( NET_FW_COMPLEX )); then fw_aggregate_status="WARN"; fw_aggregate_severity="MEDIUM"; fi
         add_result "NET-FW-001" "network" "$fw_aggregate_status" "$fw_aggregate_severity" "MEDIUM" \
             "Host firewall backend inventory completed" \
             "sources=$fw_sources_text; v4_policy=$NET_FW_V4_POLICY; v6_policy=$NET_FW_V6_POLICY; complex_rules=$NET_FW_COMPLEX." \
@@ -1899,7 +1970,9 @@ check_network() {
         [[ "$exposure" == "public" || "$exposure" == "private" || "$exposure" == "wildcard" ]] || continue
         policy="$([[ "$family" == "v4" ]] && printf '%s' "$NET_FW_V4_POLICY" || printf '%s' "$NET_FW_V6_POLICY")"
         allow_state="unknown"
-        if [[ "$policy" == "permissive" ]]; then
+        if (( NET_FW_COMPLEX )); then
+            allow_state="unknown"
+        elif [[ "$policy" == "permissive" ]]; then
             allow_state="allowed"
         elif [[ "$policy" == "restrictive" ]]; then
             if net_fw_allows "$family" "$proto" "$port"; then
@@ -3777,9 +3850,50 @@ check_mysql_mariadb() {
         "Configuration files may be world-readable, but credential files, private keys and writable data paths require tighter ownership."
 }
 
+postgres_hba_records() {
+    awk '
+        function record(s, line,    i,c,quoted,n,token,started,fields,method,type) {
+            n=0; token=""; quoted=0; started=0
+            for(i=1;i<=length(s);i++) {
+                c=substr(s,i,1)
+                if(c=="\"") {
+                    if(quoted && substr(s,i+1,1)=="\"") {token=token "\""; i++}
+                    else quoted=!quoted
+                    started=1
+                } else if(!quoted && c=="#") break
+                else if(!quoted && c ~ /[[:space:]]/) {
+                    if(started) {fields[++n]=token; token=""; started=0}
+                } else {token=token c; started=1}
+            }
+            if(started) fields[++n]=token
+            if(!n) return
+            if(quoted) {print "incomplete|" FILENAME ":" line; return}
+            type=fields[1]
+            if(type ~ /^include(_if_exists|_dir)?$/) {print "incomplete|" FILENAME ":" line; return}
+            if(type=="local") method=4
+            else if(type ~ /^host(ssl|nossl|gssenc|nogssenc)?$/) {
+                method=5
+                if(index(fields[4],"/")==0 && fields[5] ~ /^[0-9a-fA-F:.]+$/ && fields[5] ~ /[.:]/) method=6
+            } else {print "incomplete|" FILENAME ":" line; return}
+            if(n<method || fields[method] !~ /^(trust|reject|scram-sha-256|md5|password|gss|sspi|ident|peer|ldap|radius|cert|pam|bsd)$/) {
+                print "incomplete|" FILENAME ":" line; return
+            }
+            print "record|" FILENAME ":" line
+            if(fields[method]=="trust") print (type=="local" ? "local" : "host") "|" FILENAME ":" line ":" type " authentication=trust"
+        }
+        {
+            if(buffer=="") first=FNR
+            line=$0; sub(/\r$/, "", line)
+            if(line ~ /\\$/) {sub(/\\$/, "", line); buffer=buffer line; next}
+            record(buffer line, first); buffer=""
+        }
+        END {if(buffer!="") print "incomplete|" FILENAME ":" first}
+    ' "$1"
+}
+
 check_postgresql() {
     local detected=0 clusters="" cluster_count=0 listeners public_count hba_files hba_active trust_host trust_local stats="" line ver name port status owner data log
-    local query settings suffix
+    local query settings suffix hba_incomplete=0 hba_records=0 hba_scan kind detail
     have pg_lsclusters && clusters="$(pg_lsclusters --no-header 2>/dev/null || true)"
     [[ -n "$clusters" || -d "$POSTGRES_CONFIG_ROOT" ]] && detected=1
     systemctl list-unit-files --no-legend --plain 2>/dev/null | grep -Eq '^postgresql(@|\.)' && detected=1
@@ -3833,10 +3947,23 @@ check_postgresql() {
             "No action required after confirming intended local clients."
     fi
 
-    hba_files="$(find "$POSTGRES_CONFIG_ROOT" -xdev -type f -name pg_hba.conf -print 2>/dev/null | sort)"
-    hba_active="$({ while IFS= read -r line; do [[ -r "$line" ]] && awk -v file="$line" '!/^[[:space:]]*#/ && NF {print file ":" NR ":" $0}' "$line"; done <<< "$hba_files"; } | head -n 80)"
-    trust_host="$(awk 'tolower($0) ~ /:(host|hostssl|hostnossl)[[:space:]].*[[:space:]]trust([[:space:]]|$)/ {print}' <<< "$hba_active" | head -n 20)"
-    trust_local="$(awk 'tolower($0) ~ /:local[[:space:]].*[[:space:]]trust([[:space:]]|$)/ {print}' <<< "$hba_active" | head -n 20)"
+    hba_files="$(find "$POSTGRES_CONFIG_ROOT" -xdev \( -type f -o -type l \) -name pg_hba.conf -print 2>/dev/null | sort)" || hba_incomplete=1
+    trust_host=""; trust_local=""
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        if [[ ! -f "$line" || ! -r "$line" ]] || ! hba_scan="$(postgres_hba_records "$line")"; then
+            hba_incomplete=1
+            continue
+        fi
+        while IFS='|' read -r kind detail; do
+            case "$kind" in
+                host) trust_host+="$detail; " ;;
+                local) trust_local+="$detail; " ;;
+                record) hba_records=$((hba_records+1)) ;;
+                incomplete) hba_incomplete=1 ;;
+            esac
+        done <<< "$hba_scan"
+    done <<< "$hba_files"
     if [[ -n "$trust_host" ]]; then
         add_result "DB-PG-HBA-001" "database" "FAIL" "HIGH" "HIGH" \
             "PostgreSQL host authentication uses trust" "$trust_host" \
@@ -3847,10 +3974,16 @@ check_postgresql() {
             "PostgreSQL local authentication uses trust" "$trust_local" \
             "grep -RniE '^[[:space:]]*local.*[[:space:]]trust([[:space:]]|$)' $(shell_quote "$POSTGRES_CONFIG_ROOT")" \
             "Confirm every local OS account is trusted or use peer/SCRAM authentication."
-    elif [[ -n "$hba_files" ]]; then
+    elif (( hba_incomplete || hba_records==0 )); then
+        add_result "DB-PG-HBA-001" "database" "SKIP" "INFO" "HIGH" \
+            "PostgreSQL trust authentication could not be fully checked" \
+            "parsed_records=$hba_records; files may be missing, unreadable, included or use unsupported syntax." \
+            "sudo -u postgres psql -X -d postgres -c 'TABLE pg_hba_file_rules'" \
+            "Review the effective hba_file and included authentication files for every cluster."
+    else
         add_result "DB-PG-HBA-001" "database" "PASS" "INFO" "MEDIUM" \
             "No active PostgreSQL trust authentication rule was found" \
-            "hba_files=$(wc -l <<< "$hba_files" | tr -d ' '); active_rules=$(wc -l <<< "$hba_active" | tr -d ' ')." \
+            "hba_files=$(wc -l <<< "$hba_files" | tr -d ' '); active_rules=$hba_records; scope=discovered configuration files." \
             "grep -RniEv '^[[:space:]]*(#|$)' $(shell_quote "$POSTGRES_CONFIG_ROOT")/*/*/pg_hba.conf" \
             "Review broad CIDR rules and legacy md5 authentication separately."
     fi
@@ -5068,6 +5201,7 @@ admin_last_login_value_v011() {
 
 check_identity_policy_v07() {
     local login_defs max_days min_days warn_age interactive="" aging_weak="" service_shells="" admin_users="" user uid shell pass lastchg min max warn inactive expire
+    local shadow_file="${1:-/etc/shadow}" shadow_fd shadow_unreadable=0
     max_days="$(awk '$1=="PASS_MAX_DAYS" {print $2}' /etc/login.defs 2>/dev/null | tail -n1)"
     min_days="$(awk '$1=="PASS_MIN_DAYS" {print $2}' /etc/login.defs 2>/dev/null | tail -n1)"
     warn_age="$(awk '$1=="PASS_WARN_AGE" {print $2}' /etc/login.defs 2>/dev/null | tail -n1)"
@@ -5077,18 +5211,27 @@ check_identity_policy_v07() {
         "grep -E '^[[:space:]]*PASS_(MAX|MIN|WARN)' /etc/login.defs; chage -l USER" \
         "Use password aging only where local passwords are part of the authentication model."
 
-    while IFS=: read -r user pass lastchg min max warn inactive expire _; do
-        uid="$(getent passwd "$user" 2>/dev/null | cut -d: -f3)"; shell="$(getent passwd "$user" 2>/dev/null | cut -d: -f7)"
-        [[ "$uid" =~ ^[0-9]+$ ]] || continue
-        if [[ "$shell" =~ /(nologin|false)$ ]]; then continue; fi
-        if (( uid == 0 || uid >= 1000 )); then
-            interactive+="$user(uid=$uid,shell=$shell,max=${max:-unset}),"
-            if [[ "$pass" != '!'* && "$pass" != '*'* && ( -z "$max" || "$max" == "99999" ) ]]; then aging_weak+="$user,"; fi
-        elif [[ "$pass" != '!'* && "$pass" != '*'* ]]; then
-            service_shells+="$user(uid=$uid,shell=$shell),"
-        fi
-    done < /etc/shadow 2>/dev/null
-    if [[ -n "$aging_weak" ]]; then
+    if { exec {shadow_fd}< "$shadow_file"; } 2>/dev/null; then
+        while IFS=: read -r user pass lastchg min max warn inactive expire _; do
+            uid="$(getent passwd "$user" 2>/dev/null | cut -d: -f3)"; shell="$(getent passwd "$user" 2>/dev/null | cut -d: -f7)"
+            [[ "$uid" =~ ^[0-9]+$ ]] || continue
+            if [[ "$shell" =~ /(nologin|false)$ ]]; then continue; fi
+            if (( uid == 0 || uid >= 1000 )); then
+                interactive+="$user(uid=$uid,shell=$shell,max=${max:-unset}),"
+                if [[ "$pass" != '!'* && "$pass" != '*'* && ( -z "$max" || "$max" == "99999" ) ]]; then aging_weak+="$user,"; fi
+            elif [[ "$pass" != '!'* && "$pass" != '*'* ]]; then
+                service_shells+="$user(uid=$uid,shell=$shell),"
+            fi
+        done <&"$shadow_fd"
+        exec {shadow_fd}<&-
+    else
+        shadow_unreadable=1
+    fi
+    if (( shadow_unreadable )); then
+        add_result "AUTH-AGING-USERS-001" "accounts" "SKIP" "INFO" "HIGH" \
+            "Local account password expiry could not be checked" "The shadow account database could not be opened." \
+            "sudo chage -l USER" "Repeat the audit with permission to read local account metadata."
+    elif [[ -n "$aging_weak" ]]; then
         add_result "AUTH-AGING-USERS-001" "accounts" "WARN" "LOW" "MEDIUM" \
             "Some interactive local-password accounts have no practical password expiry" \
             "accounts=${aging_weak%,}; interactive_inventory=$(shorten "${interactive%,}" 900)." \
@@ -5100,7 +5243,11 @@ check_identity_policy_v07() {
             "interactive_inventory=$(shorten "${interactive:-none}" 900)." \
             "chage -l USER; getent shadow USER" "No action required."
     fi
-    if [[ -n "$service_shells" ]]; then
+    if (( shadow_unreadable )); then
+        add_result "AUTH-SERVICE-SHELL-001" "accounts" "SKIP" "INFO" "HIGH" \
+            "System account lock states could not be checked" "The shadow account database could not be opened." \
+            "sudo passwd -S USER" "Repeat the audit with permission to read local account metadata."
+    elif [[ -n "$service_shells" ]]; then
         add_result "AUTH-SERVICE-SHELL-001" "accounts" "WARN" "MEDIUM" "MEDIUM" \
             "Unlocked system accounts have interactive shells" "accounts=${service_shells%,}." \
             "awk -F: '\$3<1000 && \$7 !~ /(nologin|false)$/ {print}' /etc/passwd; passwd -S USER" \
@@ -5305,15 +5452,15 @@ check_tor_v08() {
     fi
 
     while IFS= read -r file; do [[ -f "$file" && -r "$file" ]] && configs+=("$file"); done < <(
-        find $TOR_CONFIG_ROOT -maxdepth 4 -type f -name 'torrc*' -readable 2>/dev/null | sort -u
+        find "$TOR_CONFIG_ROOT" -maxdepth 4 -type f -name 'torrc*' -readable 2>/dev/null | sort -u
     )
-    active_lines="$({ for file in "${configs[@]:-}"; do awk 'BEGIN{IGNORECASE=1} /^[[:space:]]*#/ || /^[[:space:]]*$/ {next} {print}' "$file"; done; } 2>/dev/null)"
+    active_lines="$({ for file in "${configs[@]}"; do awk '/^[[:space:]]*#/ || /^[[:space:]]*$/ {next} {print}' "$file"; done; } 2>/dev/null)"
     units="$(collect_tor_units_v010)"
     socks="$(awk 'tolower($1)=="socksport" {print $2}' <<< "$active_lines" | paste -sd, -)"
-    control="$(awk 'tolower($1)=="controlport" {print $2}' <<< "$active_lines" | paste -sd, -)"
-    control_socket="$(awk 'tolower($1)=="controlsocket" {print $2}' <<< "$active_lines" | paste -sd, -)"
+    control="$(awk 'tolower($1)=="controlport" && $2!="0" {print $2}' <<< "$active_lines" | paste -sd, -)"
+    control_socket="$(awk 'tolower($1)=="controlsocket" && $2!="0" {print $2}' <<< "$active_lines" | paste -sd, -)"
     cookie="$(awk 'tolower($1)=="cookieauthentication" {print tolower($2)}' <<< "$active_lines" | tail -n1)"
-    hashed="$(awk 'tolower($1)=="hashedcontrolpassword" {count++} END{print count+0}' <<< "$active_lines")"
+    hashed="$(awk 'tolower($1)=="hashedcontrolpassword" {value=$2; gsub(/^"|"$/, "", value); if(value ~ /^16:[0-9a-fA-F]+$/ && length(value)==61) count++} END{print count+0}' <<< "$active_lines")"
     while IFS= read -r dir; do [[ -n "$dir" ]] && hidden_dirs+=("$dir"); done < <(awk 'tolower($1)=="hiddenservicedir" {print $2}' <<< "$active_lines" | sort -u)
     hidden_ports="$(awk 'tolower($1)=="hiddenserviceport" {count++} END{print count+0}' <<< "$active_lines")"
     inventory="configs=${#configs[@]}; units=${units:-none}; socks_ports=${socks:-default-or-none}; control_ports=${control:-none}; control_sockets=${control_socket:-none}; hidden_service_dirs=${#hidden_dirs[@]}; hidden_service_ports=$hidden_ports."
@@ -5322,12 +5469,24 @@ check_tor_v08() {
         "systemctl list-units 'tor*'; grep -RniE '^(SocksPort|ControlPort|ControlSocket|HiddenServiceDir|HiddenServicePort|CookieAuthentication|HashedControlPassword)' $TOR_CONFIG_ROOT" \
         "Confirm each Tor instance, endpoint and hidden service matches the intended deployment."
 
-    if [[ -n "$control" && "$cookie" != "1" && "$cookie" != "true" && "$hashed" == "0" && -z "$control_socket" ]]; then
+    if (( ${#configs[@]} != 1 )) || grep -Eq '^[[:space:]]*%include[[:space:]]' <<< "$active_lines"; then
+        add_result "TOR-CONTROL-AUTH-001" "tor" "SKIP" "INFO" "HIGH" \
+            "Tor control authentication could not be resolved per instance" \
+            "configs=${#configs[@]}; included files or multiple configuration candidates require per-instance evaluation." \
+            "systemctl cat 'tor*'; tor --verify-config -f /etc/tor/torrc" \
+            "Check the effective control endpoints and authentication for each running Tor instance."
+    elif [[ -n "$control" && "$cookie" != "1" && "$hashed" == "0" ]]; then
         add_result "TOR-CONTROL-AUTH-001" "tor" "FAIL" "HIGH" "HIGH" \
             "Tor control endpoint lacks an inferred authentication mechanism" \
             "control_ports=$control; CookieAuthentication=${cookie:-unset}; HashedControlPassword_count=$hashed; ControlSocket=${control_socket:-none}." \
             "grep -RniE '^(ControlPort|ControlSocket|CookieAuthentication|HashedControlPassword)' $TOR_CONFIG_ROOT" \
             "Require cookie or hashed-password authentication and keep control endpoints local."
+    elif [[ -n "$control_socket" && "$cookie" != "1" && "$hashed" == "0" ]]; then
+        add_result "TOR-CONTROL-AUTH-001" "tor" "WARN" "MEDIUM" "HIGH" \
+            "Tor control socket relies on filesystem access control" \
+            "control_sockets=$control_socket; cookie_auth=${cookie:-unset}; hashed_password_entries=$hashed." \
+            "ss -lxnp; grep -RniE '^[[:space:]]*(ControlSocket|CookieAuthentication|HashedControlPassword)' $TOR_CONFIG_ROOT" \
+            "Verify socket and parent directory permissions or enable cookie/password authentication."
     elif [[ -n "$control" || -n "$control_socket" ]]; then
         add_result "TOR-CONTROL-AUTH-001" "tor" "PASS" "INFO" "MEDIUM" \
             "Tor control authentication is configured" \
@@ -5340,7 +5499,7 @@ check_tor_v08() {
             "grep -RniE '^(ControlPort|ControlSocket)' $TOR_CONFIG_ROOT" "No action required."
     fi
 
-    for dir in "${hidden_dirs[@]:-}"; do
+    for dir in "${hidden_dirs[@]}"; do
         [[ -e "$dir" ]] || { bad_dirs+="$dir(missing),"; continue; }
         stat_out="$(stat -Lc '%U|%G|%a' -- "$dir" 2>/dev/null || true)"
         IFS='|' read -r owner group mode <<< "$stat_out"
@@ -5707,13 +5866,15 @@ status_rank_v09() {
 }
 
 evidence_hash_v09() {
-    local value="${1-}" first="" last=""
-    [[ -n "$value" ]] && { first="${value:0:1}"; last="${value: -1}"; }
-    printf 'len:%s:first:%q:last:%q' "${#value}" "$first" "$last"
+    local digest
+    digest="$(printf '%s' "${1-}" | sha256sum)" || return 1
+    digest="${digest%% *}"
+    [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf 'sha256:%s' "$digest"
 }
 
 check_baseline_diff_v09() {
-    local id old_status old_severity old_hash old_rank new_rank i
+    local id old_status old_severity old_hash old_rank new_rank i header legacy=0 incomparable=0 invalid=0
     local new_count=0 resolved_count=0 worse_count=0 better_count=0 evidence_changed=0
     local new_sample="" resolved_sample="" worse_sample="" better_sample=""
     local new_display resolved_display worse_display better_display
@@ -5730,13 +5891,30 @@ check_baseline_diff_v09() {
             "stat -- $(shell_quote "$BASELINE_FILE")" "Correct the path or permissions before relying on regression detection."
         return
     fi
-    while IFS=$'\t' read -r id old_status old_severity old_hash; do
+    IFS= read -r header < "$BASELINE_FILE" || header=""
+    case "$header" in
+        '# VPScry baseline v2') ;;
+        '# VPScry baseline v1') legacy=1 ;;
+        *) invalid=1 ;;
+    esac
+    while IFS=$'\t' read -r id old_status old_severity old_hash || [[ -n "$id" ]]; do
         [[ "$id" =~ ^# || -z "$id" ]] && continue
+        if [[ ! "$id" =~ ^[A-Z0-9][A-Z0-9-]+$ || ! "$old_status" =~ ^(PASS|INFO|SKIP|WARN|FAIL)$ || ! "$old_severity" =~ ^(INFO|LOW|MEDIUM|HIGH|CRITICAL)$ || -n "${old_seen[$id]+x}" ]]; then
+            invalid=1; continue
+        fi
+        if (( ! legacy )) && [[ ! "$old_hash" =~ ^sha256:[0-9a-f]{64}$ ]]; then invalid=1; continue; fi
         old_seen["$id"]=1; old_s["$id"]="$old_status"; old_sev["$id"]="$old_severity"; old_h["$id"]="$old_hash"
     done < "$BASELINE_FILE"
+    if (( invalid )); then
+        add_result "BASELINE-DIFF-001" "baseline" "WARN" "MEDIUM" "HIGH" \
+            "The comparison baseline is invalid or unsupported" "baseline_file=$BASELINE_FILE." \
+            "head -- $(shell_quote "$BASELINE_FILE")" "Create a valid baseline after reviewing the host state."
+        return
+    fi
     for ((i=0; i<${#R_ID[@]}; i++)); do
         [[ "${R_ID[$i]}" == BASELINE-* ]] && continue
-        cur_s["${R_ID[$i]}"]="${R_STATUS[$i]}"; cur_h["${R_ID[$i]}"]="$(evidence_hash_v09 "${R_EVIDENCE[$i]}")"
+        cur_s["${R_ID[$i]}"]="${R_STATUS[$i]}"
+        cur_h["${R_ID[$i]}"]="$(evidence_hash_v09 "${R_EVIDENCE[$i]}")" || fatal "Cannot hash baseline evidence"
     done
     for id in "${!cur_s[@]}"; do
         if [[ -z "${old_seen[$id]+x}" ]]; then
@@ -5746,39 +5924,42 @@ check_baseline_diff_v09() {
         old_rank="$(status_rank_v09 "${old_s[$id]}")"; new_rank="$(status_rank_v09 "${cur_s[$id]}")"
         if (( new_rank>old_rank )); then worse_count=$((worse_count+1)); worse_sample+="$id(${old_s[$id]}→${cur_s[$id]}),"
         elif (( new_rank<old_rank )); then better_count=$((better_count+1)); better_sample+="$id(${old_s[$id]}→${cur_s[$id]}),"
+        fi
+        if (( legacy )); then incomparable=$((incomparable+1))
         elif [[ "${old_h[$id]}" != "${cur_h[$id]}" ]]; then evidence_changed=$((evidence_changed+1)); fi
     done
     for id in "${!old_seen[@]}"; do
         [[ -n "${cur_s[$id]+x}" ]] || { resolved_count=$((resolved_count+1)); resolved_sample+="$id,"; }
     done
     local bstatus="INFO" bseverity="INFO"
-    (( worse_count>0 )) && { bstatus="WARN"; bseverity="MEDIUM"; }
+    (( worse_count>0 || legacy )) && { bstatus="WARN"; bseverity="MEDIUM"; }
     new_display="${new_sample%,}"; [[ -n "$new_display" ]] || new_display="none"
     resolved_display="${resolved_sample%,}"; [[ -n "$resolved_display" ]] || resolved_display="none"
     worse_display="${worse_sample%,}"; [[ -n "$worse_display" ]] || worse_display="none"
     better_display="${better_sample%,}"; [[ -n "$better_display" ]] || better_display="none"
     add_result "BASELINE-DIFF-001" "baseline" "$bstatus" "$bseverity" "HIGH" \
         "Baseline regression summary" \
-        "baseline=$BASELINE_FILE; new=$new_count(sample=$new_display); resolved=$resolved_count(sample=$resolved_display); worse=$worse_count(sample=$worse_display); better=$better_count(sample=$better_display); evidence_changed=$evidence_changed." \
+        "baseline=$BASELINE_FILE; new=$new_count(sample=$new_display); resolved=$resolved_count(sample=$resolved_display); worse=$worse_count(sample=$worse_display); better=$better_count(sample=$better_display); evidence_changed=$evidence_changed; evidence_uncomparable=$incomparable; legacy_baseline=$legacy." \
         "diff -u $(shell_quote "$BASELINE_FILE") CURRENT_BASELINE" \
-        "$([[ "$bstatus" == WARN ]] && printf 'Review worsened statuses before accepting a new baseline.' || printf 'No worsened status was detected against the supplied baseline.')"
+        "$(if (( legacy )); then printf 'Legacy evidence fingerprints cannot be compared reliably. Review statuses and write a new SHA-256 baseline.'; elif [[ "$bstatus" == WARN ]]; then printf 'Review worsened statuses before accepting a new baseline.'; else printf 'No worsened status was detected against the supplied baseline.'; fi)"
+}
+
+render_baseline_snapshot() {
+    local file="$1" i digest
+    {
+        printf '# VPScry baseline v2\n' || return 1
+        printf '# tool_version=%s\thost=%s\tcreated=%s\n' "$VERSION" "$(redact_text "$HOSTNAME_VALUE")" "$START_ISO" || return 1
+        for ((i=0; i<${#R_ID[@]}; i++)); do
+            [[ "${R_ID[$i]}" == BASELINE-* ]] && continue
+            digest="$(evidence_hash_v09 "${R_EVIDENCE[$i]}")" || return 1
+            printf '%s\t%s\t%s\t%s\n' "${R_ID[$i]}" "${R_STATUS[$i]}" "${R_SEVERITY[$i]}" "$digest" || return 1
+        done | LC_ALL=C sort || return 1
+    } > "$file"
 }
 
 write_baseline_snapshot_v09() {
-    local file="$WRITE_BASELINE_FILE" i tmp
-    [[ -n "$file" ]] || return 0
-    mkdir -p -- "$(dirname -- "$file")" 2>/dev/null || true
-    tmp="$TMP_DIR/baseline.tsv"
-    {
-        printf '# VPScry baseline v1\n'
-        printf '# tool_version=%s\thost=%s\tcreated=%s\n' "$VERSION" "$HOSTNAME_VALUE" "$START_ISO"
-        for ((i=0; i<${#R_ID[@]}; i++)); do
-            [[ "${R_ID[$i]}" == BASELINE-* ]] && continue
-            printf '%s\t%s\t%s\t%s\n' "${R_ID[$i]}" "${R_STATUS[$i]}" "${R_SEVERITY[$i]}" "$(evidence_hash_v09 "${R_EVIDENCE[$i]}")"
-        done | sort
-    } > "$tmp"
-    install -m 0600 "$tmp" "$file" || fatal "Cannot write baseline: $file"
-    if (( RUN_AS_ROOT )) && [[ "$REPORT_OWNER_UID" =~ ^[0-9]+$ && "$REPORT_OWNER_GID" =~ ^[0-9]+$ ]] && (( REPORT_OWNER_UID>0 )); then chown "$REPORT_OWNER_UID:$REPORT_OWNER_GID" -- "$file" 2>/dev/null || true; fi
+    [[ -n "$WRITE_BASELINE_FILE" ]] || return 0
+    atomic_write_file "$WRITE_BASELINE_FILE" render_baseline_snapshot || fatal "Cannot write baseline: $WRITE_BASELINE_FILE"
 }
 
 check_policy_baseline_v09() {
@@ -5840,12 +6021,17 @@ check_kernel_hardening() {
 
 ESCAPED_VALUE=""
 json_escape_set() {
+    local code oct char escaped
     ESCAPED_VALUE="${1-}"
     ESCAPED_VALUE=${ESCAPED_VALUE//\\/\\\\}
     ESCAPED_VALUE=${ESCAPED_VALUE//\"/\\\"}
-    ESCAPED_VALUE=${ESCAPED_VALUE//$'\n'/\\n}
-    ESCAPED_VALUE=${ESCAPED_VALUE//$'\r'/\\r}
-    ESCAPED_VALUE=${ESCAPED_VALUE//$'\t'/\\t}
+    for ((code=1; code<32; code++)); do
+        printf -v oct '%03o' "$code"
+        printf -v char '%b' "\\$oct"
+        [[ "$ESCAPED_VALUE" == *"$char"* ]] || continue
+        printf -v escaped '\\u%04x' "$code"
+        ESCAPED_VALUE=${ESCAPED_VALUE//"$char"/"$escaped"}
+    done
 }
 
 html_escape_set() {
@@ -5865,57 +6051,57 @@ md_escape_set() {
 }
 
 write_text_report() {
-    local file="$OUTPUT_DIR/report.txt" i
+    local file="${1:-$OUTPUT_DIR/report.txt}" i
     {
-        printf '%s\n' "$REPORT_TITLE"
+        printf '%s\n' "$REPORT_TITLE" || return 1
         printf 'Version: %s\nAuthor: %s · %s\nTagline: %s\nHost: %s\nStarted: %s\nOnline permitted: %s\nRoot privileges: %s\nExpected ports: %s\n\n' \
-            "$VERSION" "$AUTHOR" "$WEBSITE" "$TAGLINE" "$HOSTNAME_VALUE" "$START_ISO" "$ONLINE" "$RUN_AS_ROOT" "${EXPECTED_PORTS_RAW:-none}"
+            "$VERSION" "$AUTHOR" "$WEBSITE" "$TAGLINE" "$(redact_text "$HOSTNAME_VALUE")" "$START_ISO" "$ONLINE" "$RUN_AS_ROOT" "$(redact_text "${EXPECTED_PORTS_RAW:-none}")" || return 1
         printf 'Summary: FAIL=%s WARN=%s PASS=%s INFO=%s SKIP=%s\n\n' \
-            "${COUNTS[FAIL]}" "${COUNTS[WARN]}" "${COUNTS[PASS]}" "${COUNTS[INFO]}" "${COUNTS[SKIP]}"
+            "${COUNTS[FAIL]}" "${COUNTS[WARN]}" "${COUNTS[PASS]}" "${COUNTS[INFO]}" "${COUNTS[SKIP]}" || return 1
         for ((i=0; i<${#R_ID[@]}; i++)); do
             printf '[%s] %s | %s | severity=%s confidence=%s\n' \
-                "${R_STATUS[$i]}" "${R_ID[$i]}" "${R_TITLE[$i]}" "${R_SEVERITY[$i]}" "${R_CONFIDENCE[$i]}"
-            printf 'Category: %s\n' "${R_CATEGORY[$i]}"
-            printf 'Evidence: %s\n' "${R_EVIDENCE[$i]}"
-            printf 'Verify: %s\n' "${R_VERIFY[$i]}"
-            printf 'Recommendation: %s\n\n' "${R_RECOMMENDATION[$i]}"
+                "${R_STATUS[$i]}" "${R_ID[$i]}" "${R_TITLE[$i]}" "${R_SEVERITY[$i]}" "${R_CONFIDENCE[$i]}" || return 1
+            printf 'Category: %s\n' "${R_CATEGORY[$i]}" || return 1
+            printf 'Evidence: %s\n' "${R_EVIDENCE[$i]}" || return 1
+            printf 'Verify: %s\n' "${R_VERIFY[$i]}" || return 1
+            printf 'Recommendation: %s\n\n' "${R_RECOMMENDATION[$i]}" || return 1
         done
     } > "$file"
 }
 
 write_markdown_report() {
-    local file="$OUTPUT_DIR/report.md" i e_author e_website e_tagline e_host e_ports
+    local file="${1:-$OUTPUT_DIR/report.md}" i e_author e_website e_tagline e_host e_ports
     local e_title e_evidence e_verify e_recommendation
     md_escape_set "$AUTHOR"; e_author="$ESCAPED_VALUE"
     md_escape_set "$WEBSITE"; e_website="$ESCAPED_VALUE"
     md_escape_set "$TAGLINE"; e_tagline="$ESCAPED_VALUE"
-    md_escape_set "$HOSTNAME_VALUE"; e_host="$ESCAPED_VALUE"
-    md_escape_set "${EXPECTED_PORTS_RAW:-none}"; e_ports="$ESCAPED_VALUE"
+    md_escape_set "$(redact_text "$HOSTNAME_VALUE")"; e_host="$ESCAPED_VALUE"
+    md_escape_set "$(redact_text "${EXPECTED_PORTS_RAW:-none}")"; e_ports="$ESCAPED_VALUE"
     {
-        printf '# %s\n\n' "$REPORT_TITLE"
+        printf '# %s\n\n' "$REPORT_TITLE" || return 1
         printf -- '- **Version:** `%s`\n- **Author:** %s · %s\n- **Tagline:** %s\n- **Host:** `%s`\n- **Started:** `%s`\n- **Online permitted:** `%s`\n- **Root privileges:** `%s`\n- **Expected ports:** `%s`\n\n' \
-            "$VERSION" "$e_author" "$e_website" "$e_tagline" "$e_host" "$START_ISO" "$ONLINE" "$RUN_AS_ROOT" "$e_ports"
-        printf '## Summary\n\n'
-        printf '| FAIL | WARN | PASS | INFO | SKIP |\n|---:|---:|---:|---:|---:|\n'
+            "$VERSION" "$e_author" "$e_website" "$e_tagline" "$e_host" "$START_ISO" "$ONLINE" "$RUN_AS_ROOT" "$e_ports" || return 1
+        printf '## Summary\n\n' || return 1
+        printf '| FAIL | WARN | PASS | INFO | SKIP |\n|---:|---:|---:|---:|---:|\n' || return 1
         printf '| %s | %s | %s | %s | %s |\n\n' \
-            "${COUNTS[FAIL]}" "${COUNTS[WARN]}" "${COUNTS[PASS]}" "${COUNTS[INFO]}" "${COUNTS[SKIP]}"
-        printf '## Results\n\n'
+            "${COUNTS[FAIL]}" "${COUNTS[WARN]}" "${COUNTS[PASS]}" "${COUNTS[INFO]}" "${COUNTS[SKIP]}" || return 1
+        printf '## Results\n\n' || return 1
         for ((i=0; i<${#R_ID[@]}; i++)); do
             md_escape_set "${R_TITLE[$i]}"; e_title="$ESCAPED_VALUE"
             md_escape_set "${R_EVIDENCE[$i]}"; e_evidence="$ESCAPED_VALUE"
             md_escape_set "${R_VERIFY[$i]}"; e_verify="$ESCAPED_VALUE"
             md_escape_set "${R_RECOMMENDATION[$i]}"; e_recommendation="$ESCAPED_VALUE"
-            printf '### `%s` — %s\n\n' "${R_ID[$i]}" "$e_title"
+            printf '### `%s` — %s\n\n' "${R_ID[$i]}" "$e_title" || return 1
             printf -- '- **Status:** `%s`\n- **Category:** `%s`\n- **Severity:** `%s`\n- **Confidence:** `%s`\n' \
-                "${R_STATUS[$i]}" "${R_CATEGORY[$i]}" "${R_SEVERITY[$i]}" "${R_CONFIDENCE[$i]}"
-            printf -- '- **Evidence:** %s\n' "$e_evidence"
-            printf -- '- **Verification:** `%s`\n' "$e_verify"
-            printf -- '- **Recommendation:** %s\n\n' "$e_recommendation"
+                "${R_STATUS[$i]}" "${R_CATEGORY[$i]}" "${R_SEVERITY[$i]}" "${R_CONFIDENCE[$i]}" || return 1
+            printf -- '- **Evidence:** %s\n' "$e_evidence" || return 1
+            printf -- '- **Verification:** `%s`\n' "$e_verify" || return 1
+            printf -- '- **Recommendation:** %s\n\n' "$e_recommendation" || return 1
         done
     } > "$file"
 }
 write_json_report() {
-    local file="$OUTPUT_DIR/report.json" i comma
+    local file="${1:-$OUTPUT_DIR/report.json}" i comma
     local e_program e_version e_display e_author e_website e_tagline e_host e_ports
     local e_id e_category e_status e_severity e_confidence e_title e_evidence e_verify e_recommendation
     json_escape_set "$PROGRAM"; e_program="$ESCAPED_VALUE"
@@ -5924,29 +6110,29 @@ write_json_report() {
     json_escape_set "$AUTHOR"; e_author="$ESCAPED_VALUE"
     json_escape_set "$WEBSITE"; e_website="$ESCAPED_VALUE"
     json_escape_set "$TAGLINE"; e_tagline="$ESCAPED_VALUE"
-    json_escape_set "$HOSTNAME_VALUE"; e_host="$ESCAPED_VALUE"
-    json_escape_set "${EXPECTED_PORTS_RAW:-}"; e_ports="$ESCAPED_VALUE"
+    json_escape_set "$(redact_text "$HOSTNAME_VALUE")"; e_host="$ESCAPED_VALUE"
+    json_escape_set "$(redact_text "${EXPECTED_PORTS_RAW:-}")"; e_ports="$ESCAPED_VALUE"
     {
-        printf '{\n'
-        printf '  "schema_version": "2.0.0",\n'
-        printf '  "tool": "%s",\n' "$e_program"
-        printf '  "tool_version": "%s",\n' "$e_version"
-        printf '  "display_name": "%s",\n' "$e_display"
-        printf '  "author": "%s",\n' "$e_author"
-        printf '  "website": "%s",\n' "$e_website"
-        printf '  "tagline": "%s",\n' "$e_tagline"
-        printf '  "host": "%s",\n' "$e_host"
-        printf '  "started_at": "%s",\n' "$START_ISO"
-        printf '  "online_permitted": %s,\n' "$([[ $ONLINE -eq 1 ]] && printf true || printf false)"
-        printf '  "root_privileges": %s,\n' "$([[ $RUN_AS_ROOT -eq 1 ]] && printf true || printf false)"
-        printf '  "expected_ports": "%s",\n' "$e_ports"
-        printf '  "terminal_mode": "%s",\n' "$TERMINAL_MODE"
-        printf '  "severity_profile": "%s",\n' "$SEVERITY_PROFILE"
-        printf '  "evidence_limit": %s,\n' "$EVIDENCE_LIMIT"
-        printf '  "command_timeout_seconds": %s,\n' "$COMMAND_TIMEOUT_MAX"
+        printf '{\n' || return 1
+        printf '  "schema_version": "2.0.0",\n' || return 1
+        printf '  "tool": "%s",\n' "$e_program" || return 1
+        printf '  "tool_version": "%s",\n' "$e_version" || return 1
+        printf '  "display_name": "%s",\n' "$e_display" || return 1
+        printf '  "author": "%s",\n' "$e_author" || return 1
+        printf '  "website": "%s",\n' "$e_website" || return 1
+        printf '  "tagline": "%s",\n' "$e_tagline" || return 1
+        printf '  "host": "%s",\n' "$e_host" || return 1
+        printf '  "started_at": "%s",\n' "$START_ISO" || return 1
+        printf '  "online_permitted": %s,\n' "$([[ $ONLINE -eq 1 ]] && printf true || printf false)" || return 1
+        printf '  "root_privileges": %s,\n' "$([[ $RUN_AS_ROOT -eq 1 ]] && printf true || printf false)" || return 1
+        printf '  "expected_ports": "%s",\n' "$e_ports" || return 1
+        printf '  "terminal_mode": "%s",\n' "$TERMINAL_MODE" || return 1
+        printf '  "severity_profile": "%s",\n' "$SEVERITY_PROFILE" || return 1
+        printf '  "evidence_limit": %s,\n' "$EVIDENCE_LIMIT" || return 1
+        printf '  "command_timeout_seconds": %s,\n' "$COMMAND_TIMEOUT_MAX" || return 1
         printf '  "summary": {"fail": %s, "warn": %s, "pass": %s, "info": %s, "skip": %s},\n' \
-            "${COUNTS[FAIL]}" "${COUNTS[WARN]}" "${COUNTS[PASS]}" "${COUNTS[INFO]}" "${COUNTS[SKIP]}"
-        printf '  "results": [\n'
+            "${COUNTS[FAIL]}" "${COUNTS[WARN]}" "${COUNTS[PASS]}" "${COUNTS[INFO]}" "${COUNTS[SKIP]}" || return 1
+        printf '  "results": [\n' || return 1
         for ((i=0; i<${#R_ID[@]}; i++)); do
             comma=","; (( i == ${#R_ID[@]} - 1 )) && comma=""
             json_escape_set "${R_ID[$i]}"; e_id="$ESCAPED_VALUE"
@@ -5959,27 +6145,27 @@ write_json_report() {
             json_escape_set "${R_VERIFY[$i]}"; e_verify="$ESCAPED_VALUE"
             json_escape_set "${R_RECOMMENDATION[$i]}"; e_recommendation="$ESCAPED_VALUE"
             printf '    {"id":"%s","category":"%s","status":"%s","severity":"%s","confidence":"%s","title":"%s","evidence":"%s","verification_command":"%s","recommendation":"%s"}%s\n' \
-                "$e_id" "$e_category" "$e_status" "$e_severity" "$e_confidence" "$e_title" "$e_evidence" "$e_verify" "$e_recommendation" "$comma"
+                "$e_id" "$e_category" "$e_status" "$e_severity" "$e_confidence" "$e_title" "$e_evidence" "$e_verify" "$e_recommendation" "$comma" || return 1
         done
-        printf '  ]\n}\n'
+        printf '  ]\n}\n' || return 1
     } > "$file"
 }
 write_sarif_report() {
-    local file="$OUTPUT_DIR/report.sarif" i first=1 level
+    local file="${1:-$OUTPUT_DIR/report.sarif}" i first=1 level
     local e_id e_title e_category e_severity e_confidence e_evidence e_verify e_recommendation
     {
-        printf '{"version":"2.1.0","$schema":"https://json.schemastore.org/sarif-2.1.0.json","runs":[{'
-        printf '"tool":{"driver":{"name":"VPScry","version":"%s","informationUri":"https://0ut3r.space","rules":[' "$VERSION"
+        printf '{"version":"2.1.0","$schema":"https://json.schemastore.org/sarif-2.1.0.json","runs":[{' || return 1
+        printf '"tool":{"driver":{"name":"VPScry","version":"%s","informationUri":"https://0ut3r.space","rules":[' "$VERSION" || return 1
         for ((i=0; i<${#R_ID[@]}; i++)); do
             [[ "${R_STATUS[$i]}" == FAIL || "${R_STATUS[$i]}" == WARN ]] || continue
-            (( first )) || printf ','; first=0
+            (( first )) || { printf ',' || return 1; }; first=0
             json_escape_set "${R_ID[$i]}"; e_id="$ESCAPED_VALUE"; json_escape_set "${R_TITLE[$i]}"; e_title="$ESCAPED_VALUE"
-            printf '{"id":"%s","shortDescription":{"text":"%s"}}' "$e_id" "$e_title"
+            printf '{"id":"%s","shortDescription":{"text":"%s"}}' "$e_id" "$e_title" || return 1
         done
-        printf ']}},"results":['; first=1
+        printf ']}},"results":[' || return 1; first=1
         for ((i=0; i<${#R_ID[@]}; i++)); do
             case "${R_STATUS[$i]}" in FAIL) level=error;; WARN) level=warning;; *) continue;; esac
-            (( first )) || printf ','; first=0
+            (( first )) || { printf ',' || return 1; }; first=0
             json_escape_set "${R_ID[$i]}"; e_id="$ESCAPED_VALUE"
             json_escape_set "${R_TITLE[$i]}"; e_title="$ESCAPED_VALUE"
             json_escape_set "${R_CATEGORY[$i]}"; e_category="$ESCAPED_VALUE"
@@ -5989,14 +6175,14 @@ write_sarif_report() {
             json_escape_set "${R_VERIFY[$i]}"; e_verify="$ESCAPED_VALUE"
             json_escape_set "${R_RECOMMENDATION[$i]}"; e_recommendation="$ESCAPED_VALUE"
             printf '{"ruleId":"%s","level":"%s","message":{"text":"%s"},"properties":{"category":"%s","severity":"%s","confidence":"%s","evidence":"%s","verification_command":"%s","recommendation":"%s"}}' \
-                "$e_id" "$level" "$e_title" "$e_category" "$e_severity" "$e_confidence" "$e_evidence" "$e_verify" "$e_recommendation"
+                "$e_id" "$level" "$e_title" "$e_category" "$e_severity" "$e_confidence" "$e_evidence" "$e_verify" "$e_recommendation" || return 1
         done
-        printf ']}]}\n'
+        printf ']}]}\n' || return 1
     } > "$file"
 }
 
 write_html_report() {
-    local file="$OUTPUT_DIR/report.html" i status_class
+    local file="${1:-$OUTPUT_DIR/report.html}" i status_class
     local e_title e_version e_author e_website e_tagline e_host e_ports
     local e_id e_item_title e_category e_severity e_confidence e_evidence e_verify e_recommendation
     html_escape_set "$REPORT_TITLE"; e_title="$ESCAPED_VALUE"
@@ -6004,10 +6190,10 @@ write_html_report() {
     html_escape_set "$AUTHOR"; e_author="$ESCAPED_VALUE"
     html_escape_set "$WEBSITE"; e_website="$ESCAPED_VALUE"
     html_escape_set "$TAGLINE"; e_tagline="$ESCAPED_VALUE"
-    html_escape_set "$HOSTNAME_VALUE"; e_host="$ESCAPED_VALUE"
-    html_escape_set "${EXPECTED_PORTS_RAW:-none}"; e_ports="$ESCAPED_VALUE"
+    html_escape_set "$(redact_text "$HOSTNAME_VALUE")"; e_host="$ESCAPED_VALUE"
+    html_escape_set "$(redact_text "${EXPECTED_PORTS_RAW:-none}")"; e_ports="$ESCAPED_VALUE"
     {
-        cat <<'HTML_HEAD'
+        cat <<'HTML_HEAD' || return 1
 <!doctype html>
 <html lang="en">
 <head>
@@ -6020,16 +6206,16 @@ write_html_report() {
 </head>
 <body>
 HTML_HEAD
-        printf '<h1>%s</h1>\n' "$e_title"
+        printf '<h1>%s</h1>\n' "$e_title" || return 1
         printf '<div class="meta"><div class="grid"><div class="label">Version</div><div>%s</div><div class="label">Author</div><div>%s · %s</div><div class="label">Tagline</div><div>%s</div><div class="label">Host</div><div>%s</div><div class="label">Started</div><div>%s</div><div class="label">Online permitted</div><div>%s</div><div class="label">Root privileges</div><div>%s</div><div class="label">Expected ports</div><div>%s</div></div></div>\n' \
-            "$e_version" "$e_author" "$e_website" "$e_tagline" "$e_host" "$START_ISO" "$ONLINE" "$RUN_AS_ROOT" "$e_ports"
-        printf '<h2>Summary</h2><div class="summary">'
-        printf '<span class="badge FAIL">FAIL %s</span>' "${COUNTS[FAIL]}"
-        printf '<span class="badge WARN">WARN %s</span>' "${COUNTS[WARN]}"
-        printf '<span class="badge PASS">PASS %s</span>' "${COUNTS[PASS]}"
-        printf '<span class="badge INFO">INFO %s</span>' "${COUNTS[INFO]}"
-        printf '<span class="badge SKIP">SKIP %s</span></div>\n' "${COUNTS[SKIP]}"
-        printf '<h2>Results</h2>\n'
+            "$e_version" "$e_author" "$e_website" "$e_tagline" "$e_host" "$START_ISO" "$ONLINE" "$RUN_AS_ROOT" "$e_ports" || return 1
+        printf '<h2>Summary</h2><div class="summary">' || return 1
+        printf '<span class="badge FAIL">FAIL %s</span>' "${COUNTS[FAIL]}" || return 1
+        printf '<span class="badge WARN">WARN %s</span>' "${COUNTS[WARN]}" || return 1
+        printf '<span class="badge PASS">PASS %s</span>' "${COUNTS[PASS]}" || return 1
+        printf '<span class="badge INFO">INFO %s</span>' "${COUNTS[INFO]}" || return 1
+        printf '<span class="badge SKIP">SKIP %s</span></div>\n' "${COUNTS[SKIP]}" || return 1
+        printf '<h2>Results</h2>\n' || return 1
         for ((i=0; i<${#R_ID[@]}; i++)); do
             status_class="${R_STATUS[$i]}"
             html_escape_set "${R_ID[$i]}"; e_id="$ESCAPED_VALUE"
@@ -6041,35 +6227,35 @@ HTML_HEAD
             html_escape_set "${R_VERIFY[$i]}"; e_verify="$ESCAPED_VALUE"
             html_escape_set "${R_RECOMMENDATION[$i]}"; e_recommendation="$ESCAPED_VALUE"
             printf '<section class="item"><h3><span class="badge %s">%s</span> <code>%s</code> — %s</h3><div class="grid">' \
-                "$status_class" "$status_class" "$e_id" "$e_item_title"
-            printf '<div class="label">Category</div><div>%s</div>' "$e_category"
-            printf '<div class="label">Severity</div><div>%s</div>' "$e_severity"
-            printf '<div class="label">Confidence</div><div>%s</div>' "$e_confidence"
-            printf '<div class="label">Evidence</div><div>%s</div>' "$e_evidence"
-            printf '<div class="label">Verification</div><div><code>%s</code></div>' "$e_verify"
-            printf '<div class="label">Recommendation</div><div>%s</div></div></section>\n' "$e_recommendation"
+                "$status_class" "$status_class" "$e_id" "$e_item_title" || return 1
+            printf '<div class="label">Category</div><div>%s</div>' "$e_category" || return 1
+            printf '<div class="label">Severity</div><div>%s</div>' "$e_severity" || return 1
+            printf '<div class="label">Confidence</div><div>%s</div>' "$e_confidence" || return 1
+            printf '<div class="label">Evidence</div><div>%s</div>' "$e_evidence" || return 1
+            printf '<div class="label">Verification</div><div><code>%s</code></div>' "$e_verify" || return 1
+            printf '<div class="label">Recommendation</div><div>%s</div></div></section>\n' "$e_recommendation" || return 1
         done
-        printf '</body></html>\n'
+        printf '</body></html>\n' || return 1
     } > "$file"
 }
 write_actions_report() {
-    local file="$OUTPUT_DIR/report-actions.txt" i found=0 status
+    local file="${1:-$OUTPUT_DIR/report-actions.txt}" i found=0 status
     {
-        printf 'VPScry Action Summary\n'
-        printf 'Version: %s\nHost: %s\nStarted: %s\n\n' "$VERSION" "$HOSTNAME_VALUE" "$START_ISO"
-        printf 'FAIL=%s WARN=%s\n\n' "${COUNTS[FAIL]}" "${COUNTS[WARN]}"
+        printf 'VPScry Action Summary\n' || return 1
+        printf 'Version: %s\nHost: %s\nStarted: %s\n\n' "$VERSION" "$(redact_text "$HOSTNAME_VALUE")" "$START_ISO" || return 1
+        printf 'FAIL=%s WARN=%s\n\n' "${COUNTS[FAIL]}" "${COUNTS[WARN]}" || return 1
         for status in FAIL WARN; do
             for ((i=0; i<${#R_ID[@]}; i++)); do
                 [[ "${R_STATUS[$i]}" == "$status" ]] || continue
                 found=1
-                printf '[%s] %s | severity=%s confidence=%s\n' "$status" "${R_ID[$i]} — ${R_TITLE[$i]}" "${R_SEVERITY[$i]}" "${R_CONFIDENCE[$i]}"
-                printf 'Evidence: %s\n' "${R_EVIDENCE[$i]}"
-                printf 'Verify: %s\n' "${R_VERIFY[$i]}"
-                printf 'Recommendation: %s\n\n' "${R_RECOMMENDATION[$i]}"
+                printf '[%s] %s | severity=%s confidence=%s\n' "$status" "${R_ID[$i]} — ${R_TITLE[$i]}" "${R_SEVERITY[$i]}" "${R_CONFIDENCE[$i]}" || return 1
+                printf 'Evidence: %s\n' "${R_EVIDENCE[$i]}" || return 1
+                printf 'Verify: %s\n' "${R_VERIFY[$i]}" || return 1
+                printf 'Recommendation: %s\n\n' "${R_RECOMMENDATION[$i]}" || return 1
             done
         done
         if (( ! found )); then
-            printf 'No FAIL or WARN finding was recorded.\n'
+            printf 'No FAIL or WARN finding was recorded.\n' || return 1
         fi
     } > "$file"
 }
@@ -6079,29 +6265,87 @@ format_requested() {
     [[ ",$FORMATS," == *",all,"* || ",$FORMATS," == *",$needle,"* ]]
 }
 
-write_reports() {
-    local created=0 report_file
-    [[ -e "$OUTPUT_DIR" ]] || created=1
-    mkdir -p -- "$OUTPUT_DIR" || fatal "Cannot create report directory: $OUTPUT_DIR"
-    format_requested text && write_text_report
-    format_requested markdown && write_markdown_report
-    format_requested json && write_json_report
-    format_requested html && write_html_report
-    format_requested actions && write_actions_report
-    format_requested sarif && write_sarif_report
-    write_baseline_snapshot_v09
-    chmod 0700 "$OUTPUT_DIR" 2>/dev/null || true
-    chmod u-s,g-s "$OUTPUT_DIR" 2>/dev/null || true
-    find "$OUTPUT_DIR" -maxdepth 1 -type f -exec chmod 0600 {} + 2>/dev/null || true
+validate_output_directory() {
+    local owner mode
+    IFS='|' read -r owner mode < <(stat -Lc '%u|%a' -- .) || return 1
+    [[ "$owner" == "$EUID" || ( "$RUN_AS_ROOT" == 1 && "$REPORT_OWNER_UID" =~ ^[0-9]+$ && "$owner" == "$REPORT_OWNER_UID" ) ]] || return 1
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    ! is_group_or_world_writable "$mode"
+}
 
-    if (( RUN_AS_ROOT )) && [[ "$REPORT_OWNER_UID" =~ ^[0-9]+$ && "$REPORT_OWNER_GID" =~ ^[0-9]+$ ]] && (( REPORT_OWNER_UID > 0 )); then
-        for report_file in "$OUTPUT_DIR"/report.txt "$OUTPUT_DIR"/report.md "$OUTPUT_DIR"/report.json "$OUTPUT_DIR"/report.html "$OUTPUT_DIR"/report-actions.txt "$OUTPUT_DIR"/report.sarif; do
-            [[ -f "$report_file" ]] && chown "$REPORT_OWNER_UID:$REPORT_OWNER_GID" -- "$report_file" 2>/dev/null || true
-        done
-        if (( created )); then
-            chown "$REPORT_OWNER_UID:$REPORT_OWNER_GID" -- "$OUTPUT_DIR" 2>/dev/null || true
-        fi
+atomic_write_file() (
+    local destination="$1" renderer="$2" parent name stage stage_fd parent_fd identity opened owner mode content
+    umask 077
+    parent="$(dirname -- "$destination")"; name="$(basename -- "$destination")"
+    [[ "$name" != . && "$name" != .. && "$name" != / && ! -L "${parent%/}" ]] || return 1
+    mkdir -p -- "$parent" || return 1
+    identity="$(stat -c '%d:%i' -- "$parent")" || return 1
+    [[ -d "$parent" && ! -L "$parent" ]] || return 1
+    exec {parent_fd}< "$parent" || return 1
+    opened="$(stat -Lc '%d:%i' -- "/proc/self/fd/$parent_fd")" || return 1
+    [[ "$identity" == "$opened" ]] || return 1
+    cd -P -- "/proc/self/fd/$parent_fd" || return 1
+    validate_output_directory || return 1
+    [[ ! -L "$name" && ( ! -e "$name" || -f "$name" ) ]] || return 1
+    if [[ -e "$name" ]]; then [[ "$(stat -c '%h' -- "$name")" == 1 ]] || return 1; fi
+    stage="$(mktemp -d ./.vpscry-write.XXXXXXXX)" || return 1
+    identity="$(stat -c '%d:%i:%u:%a' -- "$stage")" || return 1
+    [[ "$identity" == *":$EUID:700" && -d "$stage" && ! -L "$stage" ]] || return 1
+    exec {stage_fd}< "$stage" || { rmdir -- "$stage"; return 1; }
+    opened="$(stat -Lc '%d:%i:%u:%a' -- "/proc/self/fd/$stage_fd")" || return 1
+    [[ "$identity" == "$opened" ]] || { rmdir -- "$stage" 2>/dev/null; return 1; }
+    content="/proc/self/fd/$stage_fd/content"
+    trap 'rm -f -- "$content"; rmdir -- "$stage" 2>/dev/null || true' EXIT
+    IFS='|' read -r owner mode < <(stat -Lc '%u|%a' -- "/proc/self/fd/$stage_fd") || return 1
+    [[ "$owner" == "$EUID" && "$mode" == 700 && ! -L "$stage" ]] || return 1
+    "$renderer" "$content" || return 1
+    [[ -f "$content" && ! -L "$content" ]] || return 1
+    chmod 0600 -- "$content" || return 1
+    if (( RUN_AS_ROOT )) && [[ "$REPORT_OWNER_UID" =~ ^[0-9]+$ && "$REPORT_OWNER_GID" =~ ^[0-9]+$ ]] && (( REPORT_OWNER_UID>0 )); then
+        chown "$REPORT_OWNER_UID:$REPORT_OWNER_GID" -- "$content" || return 1
     fi
+    mv -fT -- "$content" "./$name" || return 1
+)
+
+write_reports_in_directory() (
+    local created=0 format filename writer output_fd identity opened original_output="$OUTPUT_DIR"
+    local -a outputs=('text|report.txt|write_text_report' 'markdown|report.md|write_markdown_report'
+        'json|report.json|write_json_report' 'html|report.html|write_html_report'
+        'actions|report-actions.txt|write_actions_report' 'sarif|report.sarif|write_sarif_report')
+    while [[ "$OUTPUT_DIR" != / && "$OUTPUT_DIR" == */ ]]; do OUTPUT_DIR="${OUTPUT_DIR%/}"; done
+    if [[ -n "$WRITE_BASELINE_FILE" ]]; then
+        WRITE_BASELINE_FILE="$(realpath -ms -- "$WRITE_BASELINE_FILE")" || fatal "Cannot resolve baseline path"
+        for filename in report.txt report.md report.json report.html report-actions.txt report.sarif; do
+            [[ "$(realpath -m -- "$WRITE_BASELINE_FILE")" != "$(realpath -m -- "$OUTPUT_DIR/$filename")" ]] || fatal "Baseline path conflicts with a report path"
+        done
+    fi
+    [[ ! -L "${OUTPUT_DIR%/}" ]] || fatal "Report directory must not be a symlink: $OUTPUT_DIR"
+    if [[ ! -e "$OUTPUT_DIR" ]]; then
+        (umask 077; mkdir -p -m 0700 -- "$OUTPUT_DIR") || fatal "Cannot create report directory: $OUTPUT_DIR"
+        created=1
+    fi
+    identity="$(stat -c '%d:%i' -- "$OUTPUT_DIR")" || fatal "Cannot inspect report directory: $OUTPUT_DIR"
+    [[ -d "$OUTPUT_DIR" && ! -L "$OUTPUT_DIR" ]] || fatal "Report path is not a directory: $OUTPUT_DIR"
+    exec {output_fd}< "$OUTPUT_DIR" || fatal "Cannot open report directory: $OUTPUT_DIR"
+    opened="$(stat -Lc '%d:%i' -- "/proc/self/fd/$output_fd")" || fatal "Cannot inspect report directory handle"
+    [[ "$identity" == "$opened" ]] || fatal "Report directory changed while opening it"
+    cd -P -- "/proc/self/fd/$output_fd" || fatal "Cannot enter report directory: $OUTPUT_DIR"
+    validate_output_directory || fatal "Report directory must be owned by the caller and not group/world-writable: $OUTPUT_DIR"
+    OUTPUT_DIR=.
+    for filename in "${outputs[@]}"; do
+        IFS='|' read -r format filename writer <<< "$filename"
+        format_requested "$format" || continue
+        atomic_write_file "$OUTPUT_DIR/$filename" "$writer" || fatal "Cannot write report: $original_output/$filename"
+    done
+    write_baseline_snapshot_v09
+    if (( created && RUN_AS_ROOT )) && [[ "$REPORT_OWNER_UID" =~ ^[0-9]+$ && "$REPORT_OWNER_GID" =~ ^[0-9]+$ ]] && (( REPORT_OWNER_UID>0 )); then
+        chown "$REPORT_OWNER_UID:$REPORT_OWNER_GID" -- . || fatal "Cannot set report directory owner: $original_output"
+    fi
+    return 0
+)
+
+write_reports() {
+    write_reports_in_directory || fatal "Report generation failed"
 }
 
 run_stage() {
@@ -6169,7 +6413,7 @@ print_summary() {
         "$C_RED" "${COUNTS[FAIL]}" "$C_RESET" "$C_YELLOW" "${COUNTS[WARN]}" "$C_RESET" \
         "$C_GREEN" "${COUNTS[PASS]}" "$C_RESET" "$C_BLUE" "${COUNTS[INFO]}" "$C_RESET" \
         "$C_GRAY" "${COUNTS[SKIP]}" "$C_RESET"
-    printf 'Duration: %ss\nReports: %s\n' "$duration" "$OUTPUT_DIR"
+    printf 'Duration: %ss\nReports: %s\n' "$duration" "$(redact_text "$OUTPUT_DIR")"
 }
 
 parse_args() {
@@ -6210,7 +6454,8 @@ parse_args() {
     [[ "$FORMATS" =~ ^(all|text|markdown|json|html|actions|sarif)(,(text|markdown|json|html|actions|sarif))*$ ]] || fatal "Invalid --formats value: $FORMATS"
     if [[ -z "$OUTPUT_DIR" ]]; then
         local safe_host timestamp
-        safe_host="${HOSTNAME_VALUE//[^A-Za-z0-9._-]/_}"; timestamp="$(date +%Y%m%d-%H%M%S)"
+        safe_host="$(redact_text "$HOSTNAME_VALUE")"
+        safe_host="${safe_host//[^A-Za-z0-9._-]/_}"; timestamp="$(date +%Y%m%d-%H%M%S)"
         OUTPUT_DIR="./vpscry-${safe_host}-${timestamp}"
     fi
 }
@@ -6226,12 +6471,12 @@ main() {
         print_banner
         printf '%s──────────────────────────────────────────%s\n' "$C_GRAY" "$C_RESET"
         printf 'Mode:        read-only / %s\n' "$([[ $ONLINE -eq 1 ]] && printf online-enabled || printf offline)"
-        printf 'Host:        %s\n' "$HOSTNAME_VALUE"
+        printf 'Host:        %s\n' "$(redact_text "$HOSTNAME_VALUE")"
         printf 'Privileges:  %s\n' "$([[ $RUN_AS_ROOT -eq 1 ]] && printf root || printf limited)"
         printf 'Started:     %s\n' "$START_ISO"
-        printf 'Port model:  %s\n' "${EXPECTED_PORTS_RAW:-inventory-only}"
+        printf 'Port model:  %s\n' "$(redact_text "${EXPECTED_PORTS_RAW:-inventory-only}")"
         printf 'Terminal:    %s\n' "$TERMINAL_MODE"
-        printf 'Policy:      %s%s\n' "$SEVERITY_PROFILE" "$([[ -n "$CONFIG_FILE" ]] && printf ' · config=%s' "$CONFIG_FILE" || true)"
+        printf 'Policy:      %s%s\n' "$SEVERITY_PROFILE" "$([[ -n "$CONFIG_FILE" ]] && printf ' · config=%s' "$(redact_text "$CONFIG_FILE")" || true)"
         printf 'Exit policy: %s\n' "$FAIL_ON"
         printf '%s──────────────────────────────────────────%s\n\n' "$C_GRAY" "$C_RESET"
     fi
